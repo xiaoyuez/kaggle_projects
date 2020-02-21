@@ -1,6 +1,12 @@
 # code for Bengali.AI Handwritten Grapheme Classification
 # multiple output multiclass classification on images
 
+# download feather dataset
+!mkdir feather
+!cd feather
+!kaggle datasets download -d corochann/bengaliaicv19feather
+!unzip bengaliaicv19feather.zip -d feather
+
 # libraries
 import pdb 
 import tqdm
@@ -25,22 +31,26 @@ from keras.models import Sequential, Input, Model
 from keras.layers import add, Activation, Lambda, Dense, Dropout
 from keras.layers import AveragePooling2D, GlobalAveragePooling2D, ZeroPadding2D, MaxPooling2D, Conv2D, BatchNormalization, Flatten
 
+!pip install -U git+https://github.com/qubvel/efficientnet
+import efficientnet.keras as efn
+
 # load data
 train_df = pd.read_csv('train.csv.zip')
 test_df = pd.read_csv('test.csv')
 class_df = pd.read_csv('class_map.csv')
 
-train_images = ['train_image_data_0.parquet',
-                'train_image_data_1.parquet',
-                'train_image_data_2.parquet',
-                'train_image_data_3.parquet']
+train_images = ['feather/train_image_data_0.feather',
+                'feather/train_image_data_1.feather',
+                'feather/train_image_data_2.feather',
+                'feather/train_image_data_3.feather']
 
-test_images = ['test_image_data_0.parquet',
-                'test_image_data_1.parquet',
-                'test_image_data_2.parquet',
-                'test_image_data_3.parquet']
+test_images = ['feather/test_image_data_0.feather',
+                'feather/test_image_data_1.feather',
+                'feather/test_image_data_2.feather',
+                'feather/test_image_data_3.feather']
 
 # exploratory data analysis
+
 def get_n(df, col_name, n = 10):
   if n > 0: # most
     counts = df.groupby(col_name).size().sort_values(ascending = False)[0:n]
@@ -69,16 +79,13 @@ train_df_[['grapheme_root', 'vowel_diacritic', 'consonant_diacritic']] = train_d
 # hyperparameters
 HEIGHT = 137
 WIDTH = 236
-IMG_SIZE = 128
-BATCH_SIZE = 64
+IMG_SIZE = 64
+BATCH_SIZE = 32
 
 ROOT_NUM = 168
 VOWEL_NUM = 11
 CONSONANT_NUM = 7
 
-K = 3 # the number of repeats of the training loop
-
-# some utility functions
 def bbox(img):
   # crop and center the images
     rows = np.any(img, axis=1)
@@ -107,15 +114,13 @@ def crop_resize(img0, size = IMG_SIZE, pad=16):
 
 def load_training_data(i):
   # loads training data from train parquet
-  train_df = pd.merge(pd.read_parquet(train_images[i]), train_df_, on = 'image_id')
-  
+  train_df = pd.merge(pd.read_feather(train_images[i]), train_df_, on = 'image_id')
   # prepare X train, y train
   y_train_root = train_df.grapheme_root
   y_train_vowel = train_df.vowel_diacritic
   y_train_consonant = train_df.consonant_diacritic
   X_train = train_df.drop(['image_id', 'grapheme_root', 'vowel_diacritic', 'consonant_diacritic'], axis=1)
   X_train = 255 - X_train.values.reshape(X_train.shape[0], HEIGHT, WIDTH).astype(np.uint8)
-  
   # compute class weights
   root_weight = class_weight.compute_class_weight('balanced', np.unique(y_train_root), y_train_root)
   vowel_weight = class_weight.compute_class_weight('balanced', np.unique(y_train_vowel), y_train_vowel)
@@ -139,19 +144,15 @@ def load_training_data(i):
   print("X_train has shape {}, X_val has shape {}.\n y_train_root has shape {}, y_val_root has shape {}.".format(
       X_train.shape, X_val.shape, y_train_root.shape, y_val_root.shape))
   del X_train_cropped
-  return X_train, X_val, y_train_root, y_val_root, y_train_vowel, y_val_vowel, y_train_consonant, y_val_consonant
+  return X_train, X_val, y_train_root, y_val_root, y_train_vowel, y_val_vowel, y_train_consonant, y_val_consonant, root_weight, vowel_weight, consonant_weight
 
 # build model
 def build_model(base = 'resnet', trainable = False):
   # choose a base model
   if base == 'resnet':
-    # Resnet
-    base_model = keras.applications.ResNet50(weights='imagenet', include_top = False)
+    base_model = keras.applications.ResNet50(weights = 'imagenet', include_top = False)
   elif base == 'efficientnet':
-    # EfficientNet
-    !pip install -U git+https://github.com/qubvel/efficientnet
-    import efficientnet.keras as efn 
-    base_model = efn.EfficientNetB7(weights='imagenet', include_top = False)  
+    base_model = efn.EfficientNetB7(weights = 'imagenet', include_top = False)  
   base_model.trainable = trainable
 
   # build on top of the base model
@@ -171,7 +172,6 @@ def build_model(base = 'resnet', trainable = False):
   head_consonant = Dense(7, activation = 'softmax', name = "consonant")(x)
 
   model = Model(inputs = inputs, outputs = [head_root, head_vowel, head_consonant])
-  model.summary()
 
   # compile model
   model.compile(optimizer = 'adam', 
@@ -181,31 +181,77 @@ def build_model(base = 'resnet', trainable = False):
                 metrics = ["accuracy"])
   return model
 
-model = build_model(base = 'resnet', trainable = False)
+model = build_model(base = 'resnet', trainable = True)
+
+#code from https://www.kaggle.com/kaushal2896/bengali-graphemes-starter-eda-multi-output-cnn
+class MultiOutputDataGenerator(keras.preprocessing.image.ImageDataGenerator):
+    def flow(self,
+             x,
+             y=None,
+             batch_size=32,
+             shuffle=True,
+             sample_weight=None,
+             seed=None,
+             save_to_dir=None,
+             save_prefix='',
+             save_format='png',
+             subset=None):
+
+        targets = None
+        target_lengths = {}
+        ordered_outputs = []
+        for output, target in y.items():
+            if targets is None:
+                targets = target
+            else:
+                targets = np.concatenate((targets, target), axis=1)
+            target_lengths[output] = target.shape[1]
+            ordered_outputs.append(output)
+
+
+        for flowx, flowy in super().flow(x, targets, batch_size=batch_size,
+                                         shuffle=shuffle):
+            target_dict = {}
+            i = 0
+            for output in ordered_outputs:
+                target_length = target_lengths[output]
+                target_dict[output] = flowy[:, i: i + target_length]
+                i += target_length
+
+            yield flowx, target_dict
+
+# define keras data generator 
+datagen = MultiOutputDataGenerator(rotation_range = 8,
+                                   width_shift_range = 0.08,
+                                   shear_range = 0.2,
+                                   height_shift_range = 0.08,
+                                   zoom_range = 0.08)
 
 # train time 
-for k in range(K): # kinda like k-fold
+for k in range(2): # kinda like k-fold
   for i in range(4):
-    X_train, X_val, y_train_root, y_val_root, y_train_vowel, y_val_vowel, y_train_consonant, y_val_consonant = load_training_data(i)
-
+    X_train, X_val, y_train_root, y_val_root, y_train_vowel, y_val_vowel, y_train_consonant, y_val_consonant, root_weight, vowel_weight, consonant_weight = load_training_data(i)
+    datagen.fit(X_train)
     # fit model 
     es = EarlyStopping(monitor = 'val_root_loss', patience = 2)
     mc = ModelCheckpoint('bengali_model.h5', monitor = 'val_root_loss')
 
-    model.fit(X_train, {"root": y_train_root,
-                        "vowel": y_train_vowel,
-                        "consonant": y_train_consonant},
-              validation_data = (X_val, 
-                                {"root": y_val_root,
-                                  "vowel": y_val_vowel,
-                                  "consonant": y_val_consonant}),
-              batch_size = BATCH_SIZE, 
-              epochs = 10,
-              verbose = 1,
-              callbacks = [es, mc],
-              class_weight = {"root": root_weight,
-                              "vowel": vowel_weight,
-                              "consonant": consonant_weight})
+    model.fit_generator(datagen.flow(X_train, {'root': y_train_root, 
+                                               'vowel': y_train_vowel, 
+                                               'consonant': y_train_consonant},
+                                     batch_size = BATCH_SIZE), 
+                        validation_data = datagen.flow(X_val, {'root': y_val_root, 
+                                                               'vowel': y_val_vowel, 
+                                                               'consonant': y_val_consonant},
+                                                       batch_size = BATCH_SIZE), 
+                        steps_per_epoch = len(X_train) / BATCH_SIZE,
+                        validation_steps = len(X_val) / BATCH_SIZE,
+                        epochs = 10,
+                        verbose = 1,
+                        callbacks = [es, mc],
+                        class_weight = {"root": root_weight,
+                                        "vowel": vowel_weight,
+                                        "consonant": consonant_weight})
 
     del X_train, X_val
 
@@ -242,4 +288,5 @@ for i in range(4):
 
 sub_df = pd.DataFrame({'row_id': row_id,'target':target})
 sub_df.to_csv("submission.csv", index = False)
+
 
